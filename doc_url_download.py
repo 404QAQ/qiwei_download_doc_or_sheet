@@ -39,6 +39,9 @@ MENU_WAIT = 2
 CLICK_WAIT = 1
 PAGE_STABLE_WAIT = 3
 
+# 下载记录文件
+DOWNLOAD_LOG_FILE = "downloaded_files.txt"
+
 # ---------------------------------------------------------
 
 # 配置日志格式
@@ -80,6 +83,20 @@ def print_progress_bar(current, total, prefix='', length=50):
     filled = int(length * percent)
     bar = '█' * filled + '░' * (length - filled)
     logging.info(f"{prefix} [{bar}] {current}/{total} ({percent*100:.1f}%)")
+
+
+def log_downloaded_file(filepath, filename):
+    """记录已下载的文件到txt"""
+    try:
+        log_path = os.path.join(ROOT_DIRECTORY, DOWNLOAD_LOG_FILE)
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {filepath} | {filename}\n")
+        
+        logging.debug(f"📝 已记录到下载日志: {filename}")
+    except Exception as e:
+        logging.warning(f"⚠️  写入下载日志失败: {e}")
 
 
 def setup_browser(download_path, use_profile=False, profile_path="", profile_name="Default"):
@@ -487,10 +504,11 @@ def click_export_and_download(driver, name, url, idx, total, download_dir, befor
 
 
 def process_directory(directory_path, driver, dir_idx, total_dirs):
-    """处理单个目录"""
+    """处理单个目录 - 修复返回值问题"""
     json_file = os.path.join(directory_path, "data.json")
     
     if not os.path.exists(json_file):
+        logging.warning(f"⚠️  目录 {directory_path} 中没有 data.json")
         return 0, 0, 0, "无data.json文件"
     
     dir_name = os.path.basename(directory_path)
@@ -509,8 +527,8 @@ def process_directory(directory_path, driver, dir_idx, total_dirs):
     
     infos = data.get("body", {}).get("file_list", [])
     if not infos:
-        logging.warning("⚠️  JSON 中未找到 infos，跳过此目录")
-        return 0, 0, 0, "无infos数据"
+        logging.warning("⚠️  JSON 中未找到 file_list，跳过此目录")
+        return 0, 0, 0, "无file_list数据"
     
     logging.info(f"📊 本目录共有 {len(infos)} 个文档待处理")
     
@@ -562,7 +580,7 @@ def process_directory(directory_path, driver, dir_idx, total_dirs):
             failed_details.append((name, "打开失败"))
             continue
         
-        # 在点击下载前记录文件列表（修复：移到这里）
+        # 在点击下载前记录文件列表
         before_files = {p.name for p in Path(download_dir).iterdir() if p.is_file()}
         
         # 点击导出并下载
@@ -588,6 +606,11 @@ def process_directory(directory_path, driver, dir_idx, total_dirs):
         if src == dest:
             file_size_mb = dest.stat().st_size / (1024 * 1024)
             logging.info(f"✅ 下载完成: {dest.name} ({file_size_mb:.2f} MB)")
+            
+            # 记录到下载日志
+            rel_path = os.path.relpath(str(dest), ROOT_DIRECTORY)
+            log_downloaded_file(rel_path, dest.name)
+            
             success_count += 1
         else:
             # 需要重命名，检查目标文件是否存在
@@ -604,6 +627,11 @@ def process_directory(directory_path, driver, dir_idx, total_dirs):
                 shutil.move(str(src), str(dest))
                 file_size_mb = dest.stat().st_size / (1024 * 1024)
                 logging.info(f"✅ 下载完成: {dest.name} ({file_size_mb:.2f} MB)")
+                
+                # 记录到下载日志
+                rel_path = os.path.relpath(str(dest), ROOT_DIRECTORY)
+                log_downloaded_file(rel_path, dest.name)
+                
                 success_count += 1
             except Exception as e:
                 logging.warning(f"❌ 重命名失败: {e}")
@@ -655,10 +683,15 @@ def main():
     for root, dirs, files in os.walk(ROOT_DIRECTORY):
         if "data.json" in files:
             directories_with_data.append(root)
+            rel_path = os.path.relpath(root, ROOT_DIRECTORY)
+            logging.info(f"   ✓ 找到: {rel_path}")
     
     if not directories_with_data:
         logging.warning("⚠️  未找到包含data.json的目录")
         return
+    
+    # 按路径深度排序，确保先处理父目录
+    directories_with_data.sort(key=lambda x: x.count(os.sep))
     
     logging.info(f"\n✅ 找到 {len(directories_with_data)} 个包含data.json的目录:")
     for i, directory in enumerate(directories_with_data, 1):
@@ -698,9 +731,16 @@ def main():
     # 处理每个目录
     for idx, directory in enumerate(directories_with_data, 1):
         try:
-            success, failed, skipped, status = process_directory(
-                directory, driver, idx, len(directories_with_data)
-            )
+            # 调用 process_directory，确保总是返回4个值
+            result = process_directory(directory, driver, idx, len(directories_with_data))
+            
+            # 检查返回值
+            if result is None or len(result) != 4:
+                logging.error(f"❌ process_directory 返回值异常: {result}")
+                success, failed, skipped, status = 0, 0, 0, "返回值异常"
+            else:
+                success, failed, skipped, status = result
+            
             total_success += success
             total_failed += failed
             total_skipped += skipped
@@ -728,12 +768,13 @@ def main():
             logging.error(f"❌ 处理目录 {directory} 时发生异常: {e}")
             import traceback
             logging.error(traceback.format_exc())
+            
             directory_results.append({
                 'directory': os.path.relpath(directory, ROOT_DIRECTORY),
                 'success': 0,
                 'failed': 0,
                 'skipped': 0,
-                'status': f"异常: {e}"
+                'status': f"异常: {str(e)}"
             })
     
     driver.quit()
@@ -787,7 +828,7 @@ def main():
     
     logging.info("=" * 80)
     
-    # 保存结果到文件
+    # 保存结果到JSON文件
     try:
         result_file = os.path.join(ROOT_DIRECTORY, f"download_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
         with open(result_file, "w", encoding="utf-8") as f:
@@ -804,6 +845,11 @@ def main():
         logging.info(f"\n💾 结果已保存到: {result_file}")
     except Exception as e:
         logging.warning(f"⚠️  保存结果文件失败: {e}")
+    
+    # 显示下载日志文件位置
+    log_file_path = os.path.join(ROOT_DIRECTORY, DOWNLOAD_LOG_FILE)
+    if os.path.exists(log_file_path):
+        logging.info(f"📝 下载文件日志: {log_file_path}")
     
     logging.info("\n✨ 程序执行完毕！")
 
